@@ -12,6 +12,7 @@ public static class NovaUI
     const int  CS_VREDRAW          = 0x0001;
     const int  CS_OWNDC            = 0x0020;
     const uint WM_DESTROY          = 0x0002;
+    const uint WM_TIMER            = 0x0113;
     const uint WM_PAINT            = 0x000F;
     const uint WM_LBUTTONDOWN      = 0x0201;
     const uint WM_LBUTTONUP        = 0x0202;
@@ -75,6 +76,8 @@ public static class NovaUI
     [DllImport("user32.dll")] static extern bool   TranslateMessage(ref MSG m);
     [DllImport("user32.dll")] static extern IntPtr DispatchMessage(ref MSG m);
     [DllImport("user32.dll")] static extern void   PostQuitMessage(int n);
+    [DllImport("user32.dll")] static extern IntPtr SetTimer(IntPtr hwnd, IntPtr nIDEvent, uint uElapse, IntPtr lpTimerFunc);
+    [DllImport("user32.dll")] static extern bool   KillTimer(IntPtr hwnd, IntPtr uIDEvent);
     [DllImport("user32.dll")] static extern IntPtr DefWindowProcW(IntPtr h, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] static extern IntPtr BeginPaint(IntPtr h, out PAINTSTRUCT p);
     [DllImport("user32.dll")] static extern bool   EndPaint(IntPtr h, ref PAINTSTRUCT p);
@@ -290,6 +293,8 @@ public static class NovaUI
         public int      Id;
         public string   Value   = "";
         public bool     Focused = false;
+        public int      Page    = 0;    // 0 = always visible, >0 = only on that page
+        public string   Name    = "";   // optional name for show/hide by name
 
         // Legacy single-colour slot — maps to BgColor for buttons, FgColor for labels
         public uint     Color    { get { return HasBg ? BgColor : FgColor; } }
@@ -306,8 +311,13 @@ public static class NovaUI
     static IntPtr       s_hwnd      = IntPtr.Zero;
     static IntPtr       s_hInstance = IntPtr.Zero;
     static bool         s_running   = false;
+    static Action       s_timerCb   = null;
+    static IntPtr       s_timerId   = (IntPtr)1;
+    static int          s_pendingTimerMs = 0;  // queued before window exists
     static List<Widget> s_widgets   = new List<Widget>();
     static int          s_nextId    = 0;
+    static int          s_currentPage = 1;  // active page (1-based); page 0 widgets always show
+    static int          s_pendingPage = 0;  // page tag applied to widgets as they are created
     static Dictionary<string, Action<int,int>> s_gridCallbacks = new Dictionary<string, Action<int,int>>();
     static WndProcDelegate s_proc;
     static IntPtr       s_fontNormal = IntPtr.Zero;
@@ -378,6 +388,10 @@ public static class NovaUI
 
         if (body != null) body();
 
+        // Flush any timer registered during body() — window handle now valid
+        if (s_timerCb != null && s_pendingTimerMs > 0)
+            SetTimer(s_hwnd, s_timerId, (uint)s_pendingTimerMs, IntPtr.Zero);
+
         s_running = true;
         MSG msg;
         while (s_running && GetMessage(out msg, IntPtr.Zero, 0, 0))
@@ -392,6 +406,10 @@ public static class NovaUI
         s_fontNormal = IntPtr.Zero;
         s_fontBold   = IntPtr.Zero;
         s_hwnd       = IntPtr.Zero;
+        s_widgets.Clear();
+        s_gridCallbacks.Clear();
+        s_currentPage = 1;
+        s_pendingPage = 0;
     }
 
     public static void icon(string path)
@@ -426,7 +444,7 @@ public static class NovaUI
             widget.FgColor = ParseHex(fgHex);
             widget.HasFg   = true;
         }
-        s_widgets.Add(widget);
+        AddWidget(widget);
         Repaint();
         return id;
     }
@@ -474,7 +492,7 @@ public static class NovaUI
             widget.BgColor = ParseHex(bgHex);
             widget.HasBg   = true;
         }
-        s_widgets.Add(widget);
+        AddWidget(widget);
         Repaint();
     }
 
@@ -517,7 +535,7 @@ public static class NovaUI
                     if (s_gridCallbacks.TryGetValue(capturedTag ?? "", out cb))
                         cb(capturedRow, capturedCol);
                 };
-                s_widgets.Add(widget);
+                AddWidget(widget);
             }
         }
         Repaint();
@@ -526,6 +544,49 @@ public static class NovaUI
     public static void on_button(string tag, Action<int,int> callback)
     {
         s_gridCallbacks[tag ?? ""] = callback;
+    }
+
+    // ── Page system ──────────────────────────────────────────────────────────
+    public static void _BeginPage(int page) { s_pendingPage = page; }
+    public static void _EndPage()           { s_pendingPage = 0; }
+
+    public static void set_page(int page)
+    {
+        s_currentPage = page;
+        foreach (Widget w in s_widgets)
+            if (!IsVisible(w)) w.Focused = false;
+        Repaint();
+    }
+
+    public static int get_page() { return s_currentPage; }
+
+    // Legacy helpers kept for compatibility but no longer needed
+    public static void _TagLastWidget(int page)
+    {
+        if (s_widgets.Count > 0)
+            s_widgets[s_widgets.Count - 1].Page = page;
+    }
+
+    public static void _TagWidgets(int fromIdx, int page)
+    {
+        for (int i = fromIdx; i < s_widgets.Count; i++)
+            s_widgets[i].Page = page;
+    }
+
+    public static int _WidgetCount() { return s_widgets.Count; }
+
+    static bool IsVisible(Widget w)
+    {
+        return w.Page == 0 || w.Page == s_currentPage;
+    }
+
+    public static void set_timer(int intervalMs, Action callback)
+    {
+        s_timerCb = callback;
+        s_pendingTimerMs = intervalMs;
+        // If window already exists, start immediately; otherwise RunWindow will flush it
+        if (s_hwnd != IntPtr.Zero)
+            SetTimer(s_hwnd, s_timerId, (uint)intervalMs, IntPtr.Zero);
     }
 
     public static void popup(string message)
@@ -556,7 +617,7 @@ public static class NovaUI
             lbl.H       = 18;
             lbl.Text    = caption;
             lbl.Id      = s_nextId++;
-            s_widgets.Add(lbl);
+            AddWidget(lbl);
         }
 
         int id      = s_nextId++;
@@ -572,7 +633,7 @@ public static class NovaUI
         tb.Callback = callback;
         if (IsValidHex(bgHex)) { tb.BgColor = ParseHex(bgHex); tb.HasBg = true; }
         if (IsValidHex(fgHex)) { tb.FgColor = ParseHex(fgHex); tb.HasFg = true; }
-        s_widgets.Add(tb);
+        AddWidget(tb);
         Repaint();
         return id;
     }
@@ -630,11 +691,18 @@ public static class NovaUI
             InvalidateRect(s_hwnd, IntPtr.Zero, false);
     }
 
+    static void AddWidget(Widget w)
+    {
+        w.Page = s_pendingPage;
+        s_widgets.Add(w);
+    }
+
     static Widget HitTest(int mx, int my)
     {
         for (int i = s_widgets.Count - 1; i >= 0; i--)
         {
             Widget w = s_widgets[i];
+            if (!IsVisible(w)) continue;
             if ((w.Kind == WidgetKind.Button || w.Kind == WidgetKind.Textbox) &&
                 mx >= w.X && mx < w.X + w.W &&
                 my >= w.Y && my < w.Y + w.H)
@@ -696,6 +764,7 @@ public static class NovaUI
             foreach (Widget w in s_widgets)
             {
                 if (w.Kind != WidgetKind.Button) continue;
+                if (!IsVisible(w)) { if (w.State != BtnState.Idle) { w.State = BtnState.Idle; dirty = true; } continue; }
                 bool over = pt.x >= w.X && pt.x < w.X + w.W && pt.y >= w.Y && pt.y < w.Y + w.H;
                 BtnState ns = over ? (w.State == BtnState.Down ? BtnState.Down : BtnState.Hover) : BtnState.Idle;
                 if (ns != w.State) { w.State = ns; dirty = true; }
@@ -774,9 +843,19 @@ public static class NovaUI
                 return (IntPtr)1;
             }
         }
+        else if (uMsg == WM_TIMER)
+        {
+            if (s_timerCb != null) s_timerCb();
+            return IntPtr.Zero;
+        }
         else if (uMsg == WM_CLOSE)
         {
+            if (s_timerCb != null) KillTimer(s_hwnd, s_timerId);
             s_running = false;
+            s_timerCb = null;
+            s_pendingTimerMs = 0;
+            s_widgets.Clear();
+            s_gridCallbacks.Clear();
             PostQuitMessage(0);
             return IntPtr.Zero;
         }
@@ -808,6 +887,7 @@ public static class NovaUI
 
         foreach (Widget w in s_widgets)
         {
+            if (!IsVisible(w)) continue;
             if      (w.Kind == WidgetKind.Button)  DrawButton(memDC, w);
             else if (w.Kind == WidgetKind.Label)   DrawLabel(memDC, w);
             else if (w.Kind == WidgetKind.Textbox) DrawTextbox(memDC, w);
